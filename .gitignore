@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Downloaded media + sidecars (large; not for source control)
+downloads/
+clips/
+content/
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.vtt
+*.info.json
+download.log

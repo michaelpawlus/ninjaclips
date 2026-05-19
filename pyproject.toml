@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ninjaclips"
+version = "0.1.0"
+description = "Ninja warrior content vault — download videos and produce clips for cross-platform posting."
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "yt-dlp>=2024.10.7",
+    "static-ffmpeg>=3.0",
+    "rapidfuzz>=3.0",
+]
+
+[project.scripts]
+ninjaclips = "ninjaclips.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ninjaclips*"]
