@@ -12,6 +12,14 @@ import typer
 from .clip import rough_cut
 from .download import DownloadConfig, download_urls
 from .source_resolver import find_source_file, slugify, title_fragment
+from .video_tools import (
+    cut_manifest as cut_manifest_file,
+    load_manifest,
+    make_review_sheet,
+    plan_heuristic_segments,
+    vertical_center_crop,
+    write_manifest,
+)
 from .wnl_bridge import find_appearances, resolve_db_path
 
 app = typer.Typer(
@@ -293,6 +301,209 @@ def clip(
         sys.stdout.write(json.dumps(records, indent=2) + "\n")
 
     if had_error:
+        raise typer.Exit(code=1)
+
+
+@app.command("segment")
+def segment_command(
+    source: Path = typer.Argument(..., exists=True, readable=True, help="Rough run clip to segment."),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write a JSON segment manifest to this path. Defaults to stdout.",
+    ),
+    clip_duration: float = typer.Option(
+        12.0,
+        "--clip-duration",
+        help="Duration for each heuristic segment in seconds.",
+    ),
+    count: int = typer.Option(6, "--count", help="Number of segments to plan."),
+    start_offset: float = typer.Option(
+        4.0,
+        "--start-offset",
+        help="Seconds into the rough clip where segmentation starts.",
+    ),
+    gap: float = typer.Option(
+        1.0,
+        "--gap",
+        help="Seconds between heuristic segment windows.",
+    ),
+    label_prefix: str = typer.Option(
+        "obstacle",
+        "--label-prefix",
+        help="Prefix for generated segment labels.",
+    ),
+    output_prefix: Optional[str] = typer.Option(
+        None,
+        "--output-prefix",
+        help="Prefix for generated segment file names.",
+    ),
+    json_out: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the manifest JSON on stdout even when --output is provided.",
+    ),
+) -> None:
+    """Create a heuristic segment manifest for a rough run clip."""
+    try:
+        manifest = plan_heuristic_segments(
+            source=source,
+            clip_duration=clip_duration,
+            count=count,
+            start_offset=start_offset,
+            gap=gap,
+            label_prefix=label_prefix,
+            output_prefix=output_prefix,
+        )
+    except ValueError as exc:
+        msg = {"error": str(exc), "code": 1}
+        sys.stdout.write(json.dumps(msg) + "\n")
+        raise typer.Exit(code=1) from exc
+
+    if output is not None:
+        write_manifest(manifest, output)
+        if not json_out:
+            print(f"Wrote manifest: {output}", file=sys.stderr)
+
+    if output is None or json_out:
+        sys.stdout.write(json.dumps(manifest.to_dict(), indent=2) + "\n")
+
+
+@app.command("cut-manifest")
+def cut_manifest_command(
+    manifest_path: Path = typer.Argument(..., exists=True, readable=True, help="Segment manifest JSON."),
+    output_dir: Path = typer.Option(
+        Path("./obstacle-clips"),
+        "--output-dir",
+        "-o",
+        help="Where to write generated clips.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing output files."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve outputs but skip ffmpeg."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON records on stdout."),
+) -> None:
+    """Cut all segments from a segment manifest."""
+    manifest = load_manifest(manifest_path)
+    results = cut_manifest_file(
+        manifest=manifest,
+        output_dir=output_dir,
+        force=force,
+        dry_run=dry_run,
+    )
+    if json_out:
+        sys.stdout.write(json.dumps([r.to_dict() for r in results], indent=2) + "\n")
+    else:
+        for result in results:
+            size = (
+                f"{result.file_size_bytes / 1_000_000:.1f}MB"
+                if result.file_size_bytes
+                else "-"
+            )
+            print(
+                f"[{result.status.upper()}] {result.output_path} "
+                f"(start={result.start}s dur={result.duration}s size={size})",
+                file=sys.stderr,
+            )
+            if result.error:
+                print(f"        error: {result.error}", file=sys.stderr)
+
+    if any(r.status == "error" for r in results):
+        raise typer.Exit(code=1)
+
+
+@app.command("review-sheet")
+def review_sheet_command(
+    input_path: Path = typer.Argument(..., exists=True, readable=True, help="Clip to summarize as frames."),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Output image path. Defaults to review-sheets/{input-stem}.jpg.",
+    ),
+    every_seconds: float = typer.Option(
+        3.0,
+        "--every-seconds",
+        help="Frame sampling interval in seconds.",
+    ),
+    columns: int = typer.Option(5, "--columns", help="Number of frames in the contact strip."),
+    width: int = typer.Option(240, "--width", help="Width of each sampled frame."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing output."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve output but skip ffmpeg."),
+    json_out: bool = typer.Option(False, "--json", help="Emit a JSON record on stdout."),
+) -> None:
+    """Create a quick contact-strip image for visual review."""
+    output_path = output or (Path("./review-sheets") / f"{input_path.stem}.jpg")
+    result = make_review_sheet(
+        input_path=input_path,
+        output_path=output_path,
+        every_seconds=every_seconds,
+        columns=columns,
+        width=width,
+        force=force,
+        dry_run=dry_run,
+    )
+    if json_out:
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2) + "\n")
+    else:
+        print(f"[{result.status.upper()}] {result.output_path}", file=sys.stderr)
+        if result.error:
+            print(f"        error: {result.error}", file=sys.stderr)
+    if result.status == "error":
+        raise typer.Exit(code=1)
+
+
+@app.command("vertical")
+def vertical_command(
+    input_path: Path = typer.Argument(..., exists=True, readable=True, help="Clip to export vertically."),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Output mp4 path. Defaults to vertical-clips/{input-stem}-vertical.mp4.",
+    ),
+    start: float = typer.Option(0.0, "--start", help="Start time inside input clip."),
+    duration: Optional[float] = typer.Option(
+        None,
+        "--duration",
+        help="Optional duration in seconds.",
+    ),
+    crop: str = typer.Option(
+        "center",
+        "--crop",
+        help="Crop strategy. Currently only 'center' is supported.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing output."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve output but skip ffmpeg."),
+    json_out: bool = typer.Option(False, "--json", help="Emit a JSON record on stdout."),
+) -> None:
+    """Export a clip as 9:16 vertical video."""
+    if crop != "center":
+        msg = {"error": f"Unsupported crop strategy: {crop}", "supported": ["center"], "code": 1}
+        sys.stdout.write(json.dumps(msg) + "\n")
+        raise typer.Exit(code=1)
+
+    output_path = output or (Path("./vertical-clips") / f"{input_path.stem}-vertical.mp4")
+    result = vertical_center_crop(
+        input_path=input_path,
+        output_path=output_path,
+        start=start,
+        duration=duration,
+        force=force,
+        dry_run=dry_run,
+    )
+    if json_out:
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2) + "\n")
+    else:
+        size = (
+            f"{result.file_size_bytes / 1_000_000:.1f}MB"
+            if result.file_size_bytes
+            else "-"
+        )
+        print(f"[{result.status.upper()}] {result.output_path} (size={size})", file=sys.stderr)
+        if result.error:
+            print(f"        error: {result.error}", file=sys.stderr)
+    if result.status == "error":
         raise typer.Exit(code=1)
 
 

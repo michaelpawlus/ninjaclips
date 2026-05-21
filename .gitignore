@@ -8,11 +8,15 @@ dist/
 # Downloaded media + sidecars (large; not for source control)
 downloads/
 clips/
+obstacle-clips/
+vertical-clips/
+review-sheets/
 content/
 *.mp4
 *.mkv
 *.webm
 *.m4a
+*.jpg
 *.vtt
 *.info.json
 download.log
