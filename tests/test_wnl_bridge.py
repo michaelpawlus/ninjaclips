@@ -11,6 +11,7 @@ import pytest
 from ninjaclips.wnl_bridge import (
     Appearance,
     _normalize,
+    check_index_status,
     find_appearances,
     resolve_db_path,
 )
@@ -152,3 +153,42 @@ def test_appearance_fields(fixture_db: Path):
     assert a.video_title == "Stage 4 Finals"
     assert a.confidence == pytest.approx(0.95)
     assert a.athlete_id == 1
+
+
+def test_check_index_status_ready(fixture_db: Path):
+    status = check_index_status("Drew Drechsel", "abc123XYZ00", db_path=fixture_db)
+    assert status.ready is True
+    assert status.status == "ready"
+    assert status.video_exists is True
+    assert status.video_title == "Stage 4 Finals"
+    assert status.athlete == "Drew Drechsel"
+    assert status.appearances == [
+        {"timestamp_seconds": 300, "confidence": 0.95},
+        {"timestamp_seconds": 1820, "confidence": 0.9},
+    ]
+
+
+def test_check_index_status_video_missing(fixture_db: Path):
+    status = check_index_status("Drew Drechsel", "missingVID", db_path=fixture_db)
+    assert status.ready is False
+    assert status.status == "video_missing"
+    assert status.video_exists is False
+    assert status.athlete == "Drew Drechsel"
+    assert status.appearances == []
+
+
+def test_check_index_status_appearance_missing(fixture_db: Path):
+    status = check_index_status("Jessie Graff", "def456ABC11", db_path=fixture_db)
+    assert status.ready is False
+    assert status.status == "appearance_missing"
+    assert status.video_exists is True
+    assert status.video_title == "Semifinals Vegas"
+    assert status.athlete == "Jessie Graff"
+
+
+def test_check_index_status_athlete_missing(fixture_db: Path):
+    status = check_index_status("xyzzy nonexistent", "abc123XYZ00", db_path=fixture_db)
+    assert status.ready is False
+    assert status.status == "athlete_missing"
+    assert status.video_exists is True
+    assert status.matches == []

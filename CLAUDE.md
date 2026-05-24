@@ -47,6 +47,15 @@ CLI: `ninjaclips clip` — cuts rough `.mp4`s for a named athlete by looking up
 appearance timestamps in the [WNL-Athlete-Video-Index](https://github.com/) SQLite DB
 and slicing the matching source video(s) from `downloads/` with ffmpeg.
 
+Before clipping a fresh competition, check whether the WNL index has the video
+and athlete timestamp. Treat this as a soft requirement: if it is not ready,
+manual start/end review is required before generating obstacle clips.
+
+```bash
+ninjaclips index-status --athlete "Esme Newton-Pawlus" --video M_ZNRp-UsdU
+ninjaclips index-status --athlete "Esme Newton-Pawlus" --video M_ZNRp-UsdU --json
+```
+
 ```bash
 # Cut every appearance of an athlete
 ninjaclips clip --athlete "Drew Drechsel"

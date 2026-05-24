@@ -20,7 +20,7 @@ from .video_tools import (
     vertical_center_crop,
     write_manifest,
 )
-from .wnl_bridge import find_appearances, resolve_db_path
+from .wnl_bridge import check_index_status, find_appearances, resolve_db_path
 
 app = typer.Typer(
     add_completion=False,
@@ -114,6 +114,53 @@ def download(
 
     failures = download_urls(collected, config)
     raise typer.Exit(code=1 if failures else 0)
+
+
+@app.command("index-status")
+def index_status_command(
+    athlete: str = typer.Option(..., "--athlete", "-a", help="Athlete name (fuzzy match against WNL)."),
+    video: str = typer.Option(..., "--video", help="YouTube ID to check."),
+    db_path: Optional[Path] = typer.Option(
+        None,
+        "--db-path",
+        help="Path to WNL SQLite DB (default $WNL_DB_PATH or ~/projects/WNL-Athlete-Video-Index/data/wnl_athlete_video_index.db).",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit a JSON readiness record."),
+) -> None:
+    """Check whether WNL has the athlete timestamp needed for reliable clipping."""
+    try:
+        status = check_index_status(athlete_query=athlete, youtube_id=video, db_path=db_path)
+    except FileNotFoundError as exc:
+        resolved = resolve_db_path(db_path)
+        msg = (
+            f"WNL DB not found at {resolved}. "
+            "Set WNL_DB_PATH or run ninjaclips against a system that has "
+            "WNL-Athlete-Video-Index installed."
+        )
+        if json_out:
+            sys.stdout.write(json.dumps({"error": msg, "code": 2}) + "\n")
+        else:
+            print(msg, file=sys.stderr)
+        raise typer.Exit(code=2) from exc
+
+    if json_out:
+        payload = status.to_dict()
+        payload["code"] = 0 if status.ready else 1
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    elif status.ready:
+        print(f"READY: {status.message}", file=sys.stderr)
+        for appearance in status.appearances or []:
+            timestamp = appearance["timestamp_seconds"]
+            print(f"  - timestamp={timestamp}s", file=sys.stderr)
+    else:
+        print(f"WARNING: {status.message}", file=sys.stderr)
+        print(
+            "Proceeding without an indexed athlete timestamp is likely to produce "
+            "bad rough cuts unless you manually confirm exact start/end times.",
+            file=sys.stderr,
+        )
+
+    raise typer.Exit(code=0 if status.ready else 1)
 
 
 @app.command()

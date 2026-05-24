@@ -11,7 +11,7 @@ import json
 import os
 import sqlite3
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +32,27 @@ class Appearance:
     timestamp_seconds: int
     confidence: float          # WNL's confidence_score for the appearance
     match_score: float         # rapidfuzz score for athlete_query → athlete name/alias
+
+
+@dataclass
+class IndexStatus:
+    """Readiness check for clipping one athlete from one WNL-indexed video."""
+
+    status: str
+    ready: bool
+    athlete_query: str
+    youtube_id: str
+    db_path: str
+    message: str
+    video_exists: bool = False
+    video_title: Optional[str] = None
+    athlete: Optional[str] = None
+    athlete_id: Optional[int] = None
+    matches: Optional[list[dict]] = None
+    appearances: Optional[list[dict]] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 def resolve_db_path(explicit: Optional[Path] = None) -> Path:
@@ -179,5 +200,132 @@ def find_appearances(
             for r in rows
         ]
         return appearances, matches
+    finally:
+        conn.close()
+
+
+def check_index_status(
+    athlete_query: str,
+    youtube_id: str,
+    db_path: Optional[Path] = None,
+    threshold: float = 70.0,
+) -> IndexStatus:
+    """Return whether WNL has an athlete appearance for a specific YouTube ID."""
+    path = resolve_db_path(db_path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        matches = _fuzzy_match_athletes(conn, athlete_query, threshold=threshold)
+        match_dicts = [
+            {"display_name": m.display_name, "matched_on": m.matched_on, "score": m.score}
+            for m in matches
+        ]
+
+        video_row = conn.execute(
+            "SELECT id, title FROM videos WHERE youtube_id = ?",
+            (youtube_id,),
+        ).fetchone()
+        video_exists = video_row is not None
+        video_title = str(video_row[1]) if video_row and video_row[1] is not None else None
+
+        if not matches:
+            return IndexStatus(
+                status="athlete_missing",
+                ready=False,
+                athlete_query=athlete_query,
+                youtube_id=youtube_id,
+                db_path=str(path),
+                message=f"No athlete in WNL matched '{athlete_query}'.",
+                video_exists=video_exists,
+                video_title=video_title,
+                matches=[],
+                appearances=[],
+            )
+
+        top = matches[0]
+        if len(matches) > 1 and top.score - matches[1].score < 5:
+            return IndexStatus(
+                status="ambiguous_athlete",
+                ready=False,
+                athlete_query=athlete_query,
+                youtube_id=youtube_id,
+                db_path=str(path),
+                message=f"Ambiguous athlete query: matched {len(matches)} athletes.",
+                video_exists=video_exists,
+                video_title=video_title,
+                matches=match_dicts,
+                appearances=[],
+            )
+
+        if not video_exists:
+            return IndexStatus(
+                status="video_missing",
+                ready=False,
+                athlete_query=athlete_query,
+                youtube_id=youtube_id,
+                db_path=str(path),
+                message=f"Video {youtube_id} is not in the WNL index yet.",
+                video_exists=False,
+                athlete=top.display_name,
+                athlete_id=top.athlete_id,
+                matches=match_dicts,
+                appearances=[],
+            )
+
+        rows = conn.execute(
+            """
+            SELECT ap.timestamp_seconds, ap.confidence_score
+            FROM athlete_appearances ap
+            WHERE ap.athlete_id = ? AND ap.video_id = ?
+            ORDER BY ap.timestamp_seconds
+            """,
+            (top.athlete_id, video_row[0]),
+        ).fetchall()
+        appearances = [
+            {
+                "timestamp_seconds": int(timestamp),
+                "confidence": float(confidence) if confidence is not None else 1.0,
+            }
+            for timestamp, confidence in rows
+        ]
+
+        if not appearances:
+            return IndexStatus(
+                status="appearance_missing",
+                ready=False,
+                athlete_query=athlete_query,
+                youtube_id=youtube_id,
+                db_path=str(path),
+                message=(
+                    f"WNL has video {youtube_id}, but no appearance for "
+                    f"{top.display_name} in that video."
+                ),
+                video_exists=True,
+                video_title=video_title,
+                athlete=top.display_name,
+                athlete_id=top.athlete_id,
+                matches=match_dicts,
+                appearances=[],
+            )
+
+        return IndexStatus(
+            status="ready",
+            ready=True,
+            athlete_query=athlete_query,
+            youtube_id=youtube_id,
+            db_path=str(path),
+            message=(
+                f"WNL has {len(appearances)} appearance(s) for "
+                f"{top.display_name} in {youtube_id}."
+            ),
+            video_exists=True,
+            video_title=video_title,
+            athlete=top.display_name,
+            athlete_id=top.athlete_id,
+            matches=match_dicts,
+            appearances=appearances,
+        )
     finally:
         conn.close()
