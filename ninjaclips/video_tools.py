@@ -331,6 +331,112 @@ def make_review_sheet(
     )
 
 
+def make_segment_review_sheet(
+    source: Path,
+    output_path: Path,
+    start: float,
+    duration: float,
+    every_seconds: float = 3.0,
+    columns: int = 5,
+    width: int = 240,
+    force: bool = False,
+    dry_run: bool = False,
+) -> MediaResult:
+    if output_path.exists() and not force and not dry_run:
+        return MediaResult(
+            input_path=str(source),
+            output_path=str(output_path),
+            start=start,
+            duration=duration,
+            status="exists",
+            encoding="skipped",
+            file_size_bytes=output_path.stat().st_size,
+        )
+    if dry_run:
+        return MediaResult(
+            input_path=str(source),
+            output_path=str(output_path),
+            start=start,
+            duration=duration,
+            status="dry-run",
+            encoding="dry-run",
+            file_size_bytes=None,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _resolve_ffmpeg()
+    fps = f"1/{every_seconds:g}"
+    vf = f"fps={fps},scale={width}:-1,tile={columns}x1"
+    code, output = _run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(start),
+            "-i",
+            str(source),
+            "-t",
+            str(duration),
+            "-vf",
+            vf,
+            "-frames:v",
+            "1",
+            str(output_path),
+        ]
+    )
+    if code != 0 or not output_path.exists():
+        return MediaResult(
+            input_path=str(source),
+            output_path=str(output_path),
+            start=start,
+            duration=duration,
+            status="error",
+            encoding="segment-review-sheet",
+            file_size_bytes=None,
+            error=output.strip().splitlines()[-1] if output.strip() else "ffmpeg failed",
+        )
+    return MediaResult(
+        input_path=str(source),
+        output_path=str(output_path),
+        start=start,
+        duration=duration,
+        status="created",
+        encoding="segment-review-sheet",
+        file_size_bytes=output_path.stat().st_size,
+    )
+
+
+def make_manifest_review_sheets(
+    manifest: SegmentManifest,
+    output_dir: Path,
+    every_seconds: float = 3.0,
+    columns: int = 5,
+    width: int = 240,
+    force: bool = False,
+    dry_run: bool = False,
+) -> list[MediaResult]:
+    source = Path(manifest.source)
+    results: list[MediaResult] = []
+    for segment in manifest.segments:
+        output_name = Path(segment.output_name).with_suffix(".jpg").name
+        results.append(
+            make_segment_review_sheet(
+                source=source,
+                output_path=output_dir / output_name,
+                start=segment.start,
+                duration=segment.duration,
+                every_seconds=every_seconds,
+                columns=columns,
+                width=width,
+                force=force,
+                dry_run=dry_run,
+            )
+        )
+    return results
+
+
 def vertical_center_crop(
     input_path: Path,
     output_path: Path,

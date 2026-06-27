@@ -90,6 +90,9 @@ ninjaclips cut-manifest manifests/esme.json --output-dir obstacle-clips
 # Create a contact-strip review sheet for a clip
 ninjaclips review-sheet obstacle-clips/esme-01-obstacle-01.mp4
 
+# Create contact-strip review sheets for every segment in a manifest
+ninjaclips review-manifest manifests/esme.json
+
 # Export a 9:16 center-crop version for short-form video
 ninjaclips vertical obstacle-clips/esme-06-finish.mp4 --duration 15
 ```
@@ -112,6 +115,14 @@ cut-manifest:
 review-sheet:
   --every-seconds N  # frame sampling cadence, default 3
   --columns N        # contact strip frame count, default 5
+  --json
+
+review-manifest:
+  --output-dir DIR   # default ./review-sheets
+  --every-seconds N  # frame sampling cadence, default 3
+  --columns N        # contact strip frame count, default 5
+  --dry-run          # resolve output paths without ffmpeg
+  --force            # overwrite existing sheets
   --json
 
 vertical:
