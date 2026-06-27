@@ -15,6 +15,7 @@ from .source_resolver import find_source_file, slugify, title_fragment
 from .video_tools import (
     cut_manifest as cut_manifest_file,
     load_manifest,
+    make_manifest_review_sheets,
     make_review_sheet,
     plan_heuristic_segments,
     vertical_center_crop,
@@ -497,6 +498,58 @@ def review_sheet_command(
         if result.error:
             print(f"        error: {result.error}", file=sys.stderr)
     if result.status == "error":
+        raise typer.Exit(code=1)
+
+
+@app.command("review-manifest")
+def review_manifest_command(
+    manifest_path: Path = typer.Argument(..., exists=True, readable=True, help="Segment manifest JSON."),
+    output_dir: Path = typer.Option(
+        Path("./review-sheets"),
+        "--output-dir",
+        "-o",
+        help="Where to write generated contact sheets.",
+    ),
+    every_seconds: float = typer.Option(
+        3.0,
+        "--every-seconds",
+        help="Frame sampling interval in seconds.",
+    ),
+    columns: int = typer.Option(5, "--columns", help="Number of frames in each contact strip."),
+    width: int = typer.Option(240, "--width", help="Width of each sampled frame."),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing outputs."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Resolve outputs but skip ffmpeg."),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON records on stdout."),
+) -> None:
+    """Create contact-strip review sheets for every segment in a manifest."""
+    manifest = load_manifest(manifest_path)
+    results = make_manifest_review_sheets(
+        manifest=manifest,
+        output_dir=output_dir,
+        every_seconds=every_seconds,
+        columns=columns,
+        width=width,
+        force=force,
+        dry_run=dry_run,
+    )
+    if json_out:
+        sys.stdout.write(json.dumps([r.to_dict() for r in results], indent=2) + "\n")
+    else:
+        for result in results:
+            size = (
+                f"{result.file_size_bytes / 1_000_000:.1f}MB"
+                if result.file_size_bytes
+                else "-"
+            )
+            print(
+                f"[{result.status.upper()}] {result.output_path} "
+                f"(start={result.start}s dur={result.duration}s size={size})",
+                file=sys.stderr,
+            )
+            if result.error:
+                print(f"        error: {result.error}", file=sys.stderr)
+
+    if any(r.status == "error" for r in results):
         raise typer.Exit(code=1)
 
 
