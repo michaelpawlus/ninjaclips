@@ -1,0 +1,4 @@
+# One row per run to archive: url, start, end, athlete
+# Times accept 4243 or 1:10:43. Lines starting with # are ignored.
+url,start,end,athlete
+https://www.youtube.com/live/AIYxvfxnbz8?t=4243,1:10:43,1:14:55,Esme Newton-Pawlus

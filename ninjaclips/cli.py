@@ -5,15 +5,21 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 
+from .batch import BatchError, load_jobs
 from .clip import rough_cut
 from .download import DownloadConfig, download_urls
-from .source_resolver import find_source_file, slugify, title_fragment
+from .ledger import mark_confirmed, read_record
+from .media import probe_video
+from .prune import apply_prune, plan_prune
+from .source_resolver import find_source_file, section_offset, slugify, title_fragment
+from .timecode import TimecodeError, format_timecode, parse_timecode
 from .video_tools import (
     cut_manifest as cut_manifest_file,
+)
+from .video_tools import (
     load_manifest,
     make_manifest_review_sheets,
     make_review_sheet,
@@ -30,6 +36,12 @@ app = typer.Typer(
 )
 
 
+DB_PATH_HELP = (
+    "Path to the WNL SQLite DB (default: $WNL_DB_PATH, else "
+    "~/projects/WNL-Athlete-Video-Index/data/wnl_athlete_video_index.db)."
+)
+
+
 def _read_url_file(path: Path) -> list[str]:
     urls: list[str] = []
     for raw in path.read_text().splitlines():
@@ -42,11 +54,11 @@ def _read_url_file(path: Path) -> list[str]:
 
 @app.command()
 def download(
-    urls: Optional[list[str]] = typer.Argument(
+    urls: list[str] | None = typer.Argument(
         None,
         help="YouTube URLs (videos or playlists). Pass via args, --file, or stdin.",
     ),
-    file: Optional[Path] = typer.Option(
+    file: Path | None = typer.Option(
         None,
         "--file",
         "-f",
@@ -80,6 +92,15 @@ def download(
         "--dry-run",
         help="Resolve metadata only; do not download media.",
     ),
+    section: str | None = typer.Option(
+        None,
+        "--section",
+        help=(
+            "Download only a time range, e.g. '1:09:00-1:16:00' or '4140-4560'. "
+            "Vastly faster and smaller than a full download, but the window can "
+            "never be widened later — pad generously."
+        ),
+    ),
     json_output: bool = typer.Option(
         False,
         "--json",
@@ -87,6 +108,23 @@ def download(
     ),
 ) -> None:
     """Download YouTube videos for the ninja clips vault."""
+    section_start = section_end = None
+    if section is not None:
+        try:
+            raw_start, _, raw_end = section.partition("-")
+            if not raw_end:
+                raise TimecodeError("expected START-END")
+            section_start = parse_timecode(raw_start)
+            section_end = parse_timecode(raw_end)
+        except TimecodeError as exc:
+            typer.echo(f"Invalid --section {section!r}: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        if section_end <= section_start:
+            typer.echo(
+                f"Invalid --section {section!r}: end must be after start.", err=True
+            )
+            raise typer.Exit(code=2)
+
     collected: list[str] = list(urls or [])
     if file is not None:
         collected.extend(_read_url_file(file))
@@ -111,6 +149,8 @@ def download(
         info_json=info_json,
         dry_run=dry_run,
         json_output=json_output,
+        section_start=section_start,
+        section_end=section_end,
     )
 
     failures = download_urls(collected, config)
@@ -121,10 +161,10 @@ def download(
 def index_status_command(
     athlete: str = typer.Option(..., "--athlete", "-a", help="Athlete name (fuzzy match against WNL)."),
     video: str = typer.Option(..., "--video", help="YouTube ID to check."),
-    db_path: Optional[Path] = typer.Option(
+    db_path: Path | None = typer.Option(
         None,
         "--db-path",
-        help="Path to WNL SQLite DB (default $WNL_DB_PATH or ~/projects/WNL-Athlete-Video-Index/data/wnl_athlete_video_index.db).",
+        help=DB_PATH_HELP,
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit a JSON readiness record."),
 ) -> None:
@@ -164,10 +204,137 @@ def index_status_command(
     raise typer.Exit(code=0 if status.ready else 1)
 
 
+def _describe_clip(result, out_path: Path, start: float, dur: float) -> None:
+    """Print a one-line human summary of a clip result to stderr."""
+    size = (
+        f"{result.file_size_bytes / 1_000_000:.1f}MB" if result.file_size_bytes else "-"
+    )
+    accuracy = "" if result.frame_accurate else "  !! keyframe-snapped, not frame-accurate"
+    print(
+        f"[{result.status.upper()}] {out_path.name}  "
+        f"(start={start:g}s dur={dur:g}s enc={result.encoding} size={size}){accuracy}",
+        file=sys.stderr,
+    )
+    if result.error:
+        print(f"        error: {result.error}", file=sys.stderr)
+
+
+def _manual_clip(
+    at: float,
+    end: float | None,
+    duration: float,
+    pre_pad: float,
+    video: str | None,
+    athlete: str | None,
+    label: str | None,
+    downloads_dir: Path,
+    output_dir: Path,
+    fast_proxy: bool,
+    force: bool,
+    dry_run: bool,
+    json_out: bool,
+) -> None:
+    """Cut one clip at an operator-supplied timestamp, with no WNL lookup."""
+
+    def fail(msg: str, code: int = 2):
+        if json_out:
+            sys.stdout.write(json.dumps({"error": msg, "code": code}) + "\n")
+        else:
+            print(msg, file=sys.stderr)
+        raise typer.Exit(code=code)
+
+    if not video:
+        fail("--at requires --video YOUTUBE_ID to identify the source file.")
+    if end is not None and end <= at:
+        fail(f"--end ({end:g}s) must be greater than --at ({at:g}s).")
+
+    source = find_source_file(video, downloads_dir)
+    if source is None:
+        fail(
+            f"{video} not found in {downloads_dir}/ — "
+            f"run: ninjaclips download https://www.youtube.com/watch?v={video}",
+            code=1,
+        )
+
+    start = max(0.0, at - pre_pad)
+    # --end is the end of the run itself, so the clip must still cover the
+    # pre-pad lead-in that `start` backed up into.
+    effective = (end - start) if end is not None else duration
+
+    offset = section_offset(source)
+    info = probe_video(source)
+    if info.duration is not None and (start - offset) >= info.duration:
+        span = f"{format_timecode(offset)}-{format_timecode(offset + info.duration)}"
+        fail(
+            f"--at {at:g}s is past the end of the source file "
+            f"(covers {span}, {info.duration:.1f}s long).",
+            code=1,
+        )
+
+    name = slugify(athlete or label or "clip")
+    out_path = output_dir / f"{name} - {title_fragment(source)} [{video}] [{int(start):06d}].mp4"
+
+    if not json_out:
+        vfr = " (source is VFR — output forced to CFR)" if info.is_vfr else ""
+        print(
+            f"Manual cut: {video} @ {at:g}s (clip {start:g}-{start + effective:g}s) "
+            f"{info.width}x{info.height} @ {info.fps:.3f}fps{vfr}",
+            file=sys.stderr,
+        )
+
+    result = rough_cut(
+        source_file=source,
+        output_path=out_path,
+        youtube_id=video,
+        athlete=athlete,
+        label=label,
+        start=start,
+        duration=effective,
+        origin="manual",
+        pre_pad=pre_pad,
+        fast_proxy=fast_proxy,
+        dry_run=dry_run,
+        force=force,
+        info=info,
+        source_offset=offset,
+    )
+
+    if json_out:
+        sys.stdout.write(json.dumps(result.to_dict(), indent=2) + "\n")
+    else:
+        _describe_clip(result, out_path, start, effective)
+
+    raise typer.Exit(code=1 if result.status == "error" else 0)
+
+
 @app.command()
 def clip(
-    athlete: str = typer.Option(..., "--athlete", "-a", help="Athlete name (fuzzy match against WNL)."),
-    video: Optional[str] = typer.Option(None, "--video", help="Limit to a single YouTube ID."),
+    athlete: str | None = typer.Option(
+        None,
+        "--athlete",
+        "-a",
+        help="Athlete name (fuzzy match against WNL). Optional when --at is given.",
+    ),
+    at: float | None = typer.Option(
+        None,
+        "--at",
+        help=(
+            "Manual mode: source-absolute timestamp in seconds where the run "
+            "starts (the `t=` value from a YouTube URL). Skips WNL entirely; "
+            "requires --video."
+        ),
+    ),
+    end: float | None = typer.Option(
+        None,
+        "--end",
+        help="Manual mode: source-absolute end timestamp. Overrides --duration.",
+    ),
+    label: str | None = typer.Option(
+        None,
+        "--label",
+        help="Manual mode: name for the clip when no athlete is given.",
+    ),
+    video: str | None = typer.Option(None, "--video", help="Limit to a single YouTube ID."),
     downloads_dir: Path = typer.Option(
         Path("./downloads"),
         "--downloads-dir",
@@ -179,12 +346,16 @@ def clip(
         "-o",
         help="Where to write rough-cut .mp4 files.",
     ),
-    pre_pad: int = typer.Option(5, "--pre-pad", help="Seconds before the timestamp to include."),
-    duration: int = typer.Option(90, "--duration", help="Max clip duration in seconds."),
-    reencode: bool = typer.Option(
+    pre_pad: float = typer.Option(5, "--pre-pad", help="Seconds before the timestamp to include."),
+    duration: float = typer.Option(90, "--duration", help="Max clip duration in seconds."),
+    fast_proxy: bool = typer.Option(
         False,
-        "--reencode",
-        help="Re-encode instead of stream-copy (slower, no frozen leader).",
+        "--fast-proxy",
+        help=(
+            "Stream-copy instead of re-encoding. Much faster, but snaps to the "
+            "nearest keyframe (seconds of drift) and produces a variable-frame-rate "
+            "file. Preview only — blocks `prune` and is unsafe for analysis."
+        ),
     ),
     force: bool = typer.Option(False, "--force", help="Overwrite existing clip files."),
     dry_run: bool = typer.Option(
@@ -192,10 +363,10 @@ def clip(
         "--dry-run",
         help="Resolve everything but skip ffmpeg invocation.",
     ),
-    db_path: Optional[Path] = typer.Option(
+    db_path: Path | None = typer.Option(
         None,
         "--db-path",
-        help="Path to WNL SQLite DB (default $WNL_DB_PATH or ~/projects/WNL-Athlete-Video-Index/data/wnl_athlete_video_index.db).",
+        help=DB_PATH_HELP,
     ),
     json_out: bool = typer.Option(
         False,
@@ -204,6 +375,32 @@ def clip(
     ),
 ) -> None:
     """Cut rough clips for an athlete from already-downloaded source videos."""
+    if at is not None:
+        _manual_clip(
+            at=at,
+            end=end,
+            duration=duration,
+            pre_pad=pre_pad,
+            video=video,
+            athlete=athlete,
+            label=label,
+            downloads_dir=downloads_dir,
+            output_dir=output_dir,
+            fast_proxy=fast_proxy,
+            force=force,
+            dry_run=dry_run,
+            json_out=json_out,
+        )
+        return
+
+    if athlete is None:
+        msg = "Provide --athlete for WNL lookup, or --at SECONDS --video ID for manual mode."
+        if json_out:
+            sys.stdout.write(json.dumps({"error": msg, "code": 2}) + "\n")
+        else:
+            print(msg, file=sys.stderr)
+        raise typer.Exit(code=2)
+
     try:
         appearances, matches = find_appearances(athlete, db_path=db_path)
     except FileNotFoundError as exc:
@@ -296,9 +493,12 @@ def clip(
 
         fragment = title_fragment(source)
         slug = slugify(canonical)
+        # Probe once per source, not once per appearance.
+        info = probe_video(source) if not dry_run else None
+        offset = section_offset(source)
 
         for idx, app_row in enumerate(group):
-            start = max(0, app_row.timestamp_seconds - pre_pad)
+            start = max(0.0, app_row.timestamp_seconds - pre_pad)
             # Cap duration so we don't spill into the next athlete's window.
             effective = duration
             if idx + 1 < len(group):
@@ -307,7 +507,7 @@ def clip(
                 if 0 < gap < effective:
                     effective = gap
 
-            out_name = f"{slug} - {fragment} [{yid}] [{start:06d}].mp4"
+            out_name = f"{slug} - {fragment} [{yid}] [{int(start):06d}].mp4"
             out_path = output_dir / out_name
 
             result = rough_cut(
@@ -317,9 +517,14 @@ def clip(
                 athlete=canonical,
                 start=start,
                 duration=effective,
-                reencode=reencode,
+                origin="wnl",
+                wnl_timestamp=app_row.timestamp_seconds,
+                pre_pad=pre_pad,
+                fast_proxy=fast_proxy,
                 dry_run=dry_run,
                 force=force,
+                info=info,
+                source_offset=offset,
             )
             record = result.to_dict()
             record["video_title"] = group[0].video_title
@@ -331,19 +536,7 @@ def clip(
                 had_error = True
 
             if not json_out:
-                tag = result.status.upper()
-                size = (
-                    f"{result.file_size_bytes / 1_000_000:.1f}MB"
-                    if result.file_size_bytes
-                    else "-"
-                )
-                print(
-                    f"[{tag}] {out_path.name}  (start={start}s dur={effective}s "
-                    f"enc={result.encoding} size={size})",
-                    file=sys.stderr,
-                )
-                if result.error:
-                    print(f"        error: {result.error}", file=sys.stderr)
+                _describe_clip(result, out_path, start, effective)
 
     if json_out:
         sys.stdout.write(json.dumps(records, indent=2) + "\n")
@@ -352,10 +545,323 @@ def clip(
         raise typer.Exit(code=1)
 
 
+@app.command("batch")
+def batch_command(
+    jobs_file: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="CSV or JSON list of runs: url, start, end, athlete[, label].",
+    ),
+    downloads_dir: Path = typer.Option(Path("./downloads"), "--downloads-dir"),
+    output_dir: Path = typer.Option(Path("./clips"), "--output-dir", "-o"),
+    max_height: int = typer.Option(1440, "--max-height", help="Cap video resolution."),
+    pre_pad: float = typer.Option(
+        30, "--pre-pad", help="Seconds of lead-in kept before each start."
+    ),
+    post_pad: float = typer.Option(
+        30, "--post-pad", help="Seconds kept after each end."
+    ),
+    sections: bool = typer.Option(
+        False,
+        "--sections",
+        help=(
+            "Download only each run's window instead of the whole video. Much "
+            "faster and smaller, but the window can never be widened later."
+        ),
+    ),
+    section_margin: float = typer.Option(
+        120,
+        "--section-margin",
+        help="Extra seconds fetched either side of the padded window with --sections.",
+    ),
+    skip_download: bool = typer.Option(
+        False, "--skip-download", help="Cut only; assume sources are already present."
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing clips."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Resolve and report the plan without downloading."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON records on stdout."),
+) -> None:
+    """Download and rough-cut a list of runs, unattended.
+
+    Every row is validated before the first download, so a typo in the last
+    line fails immediately rather than an hour in. Clips are left UNCONFIRMED —
+    review them with `confirm`, then reclaim disk with `prune`.
+    """
+    try:
+        jobs = load_jobs(jobs_file)
+    except BatchError as exc:
+        if json_out:
+            sys.stdout.write(json.dumps({"error": str(exc), "code": 2}) + "\n")
+        else:
+            print(f"Batch file error — nothing was downloaded.\n  {exc}", file=sys.stderr)
+        raise typer.Exit(code=2) from exc
+
+    if not jobs:
+        print(f"No jobs found in {jobs_file}.", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    if not json_out:
+        print(f"{len(jobs)} job(s) from {jobs_file}:", file=sys.stderr)
+        for job in jobs:
+            window = f"{format_timecode(job.start)}-{format_timecode(job.end)}"
+            print(
+                f"  [{job.row}] {job.youtube_id}  {window}  "
+                f"({job.end - job.start:.0f}s)  {job.athlete or job.label}",
+                file=sys.stderr,
+            )
+        print("-" * 60, file=sys.stderr)
+
+    records: list[dict] = []
+    failures = 0
+
+    for job in jobs:
+        clip_start = max(0.0, job.start - pre_pad)
+        clip_end = job.end + post_pad
+        record: dict = {
+            "row": job.row,
+            "youtube_id": job.youtube_id,
+            "athlete": job.athlete,
+            "label": job.label,
+            "run_start": job.start,
+            "run_end": job.end,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+        }
+
+        if not skip_download:
+            config = DownloadConfig(
+                output_dir=downloads_dir,
+                max_height=max_height,
+                dry_run=dry_run,
+                json_output=False,
+            )
+            if sections:
+                config.section_start = max(0.0, clip_start - section_margin)
+                config.section_end = clip_end + section_margin
+            if not json_out:
+                scope = (
+                    f"section {format_timecode(config.section_start)}-"
+                    f"{format_timecode(config.section_end)}"
+                    if sections
+                    else "full video"
+                )
+                print(f"[{job.row}] downloading {job.youtube_id} ({scope})", file=sys.stderr)
+            if download_urls([job.watch_url], config):
+                record["status"] = "download-failed"
+                records.append(record)
+                failures += 1
+                if not json_out:
+                    print(f"[{job.row}] DOWNLOAD FAILED — skipping cut", file=sys.stderr)
+                continue
+
+        source = find_source_file(job.youtube_id, downloads_dir)
+        if source is None:
+            record["status"] = "source-missing"
+            records.append(record)
+            failures += 1
+            if not json_out:
+                print(f"[{job.row}] source not found in {downloads_dir}", file=sys.stderr)
+            continue
+
+        offset = section_offset(source)
+        info = probe_video(source) if not dry_run else None
+        name = slugify(job.athlete or job.label or "clip")
+        out_path = output_dir / (
+            f"{name} - {title_fragment(source)} [{job.youtube_id}] [{int(clip_start):06d}].mp4"
+        )
+
+        result = rough_cut(
+            source_file=source,
+            output_path=out_path,
+            youtube_id=job.youtube_id,
+            athlete=job.athlete,
+            label=job.label,
+            start=clip_start,
+            duration=clip_end - clip_start,
+            origin="batch",
+            pre_pad=pre_pad,
+            dry_run=dry_run,
+            force=force,
+            info=info,
+            source_offset=offset,
+        )
+        record.update(result.to_dict())
+        records.append(record)
+        if result.status == "error":
+            failures += 1
+        if not json_out:
+            _describe_clip(result, out_path, clip_start, clip_end - clip_start)
+
+    if json_out:
+        sys.stdout.write(json.dumps(records, indent=2) + "\n")
+    else:
+        done = len(jobs) - failures
+        print(
+            f"\n{done}/{len(jobs)} cut. All clips are UNCONFIRMED — review with "
+            "`ninjaclips confirm <clip>`, then `ninjaclips prune` to reclaim disk.",
+            file=sys.stderr,
+        )
+
+    raise typer.Exit(code=1 if failures else 0)
+
+
+@app.command("confirm")
+def confirm_command(
+    clip_path: Path = typer.Argument(
+        ..., exists=True, readable=True, help="Rough-cut clip to review and confirm."
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Mark the clip confirmed. Without this, only builds the review sheet.",
+    ),
+    unconfirm: bool = typer.Option(
+        False, "--unconfirm", help="Clear a previous confirmation."
+    ),
+    sheet_dir: Path = typer.Option(
+        Path("./review-sheets"), "--sheet-dir", help="Where to write the contact sheet."
+    ),
+    every_seconds: float = typer.Option(3.0, "--every-seconds", help="Frame sampling interval."),
+    columns: int = typer.Option(5, "--columns", help="Frames per row in the contact sheet."),
+    rows: int = typer.Option(1, "--rows", help="Rows in the contact sheet grid."),
+    no_sheet: bool = typer.Option(False, "--no-sheet", help="Skip contact-sheet generation."),
+    json_out: bool = typer.Option(False, "--json", help="Emit a JSON record on stdout."),
+) -> None:
+    """Review a rough cut and mark it confirmed, unlocking `prune` for its source."""
+    record = read_record(clip_path)
+    if record is None:
+        msg = (
+            f"No ledger sidecar for {clip_path.name} "
+            f"(expected {clip_path.with_suffix('.json').name}). "
+            "Only clips produced by `ninjaclips clip` can be confirmed."
+        )
+        if json_out:
+            sys.stdout.write(json.dumps({"error": msg, "code": 2}) + "\n")
+        else:
+            print(msg, file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    sheet_path = None
+    if not no_sheet:
+        sheet = make_review_sheet(
+            input_path=clip_path,
+            output_path=sheet_dir / f"{clip_path.stem}.jpg",
+            every_seconds=every_seconds,
+            columns=columns,
+            rows=rows,
+            force=True,
+        )
+        sheet_path = sheet.output_path
+        if not json_out:
+            print(f"Review sheet: {sheet.output_path}", file=sys.stderr)
+
+    if yes or unconfirm:
+        record = mark_confirmed(clip_path, confirmed=not unconfirm)
+
+    payload = record.to_dict()
+    payload["review_sheet"] = sheet_path
+    if json_out:
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        state = "CONFIRMED" if record.confirmed else "UNCONFIRMED"
+        print(
+            f"[{state}] {clip_path.name}\n"
+            f"  source      {Path(record.source_file).name}\n"
+            f"  source time {record.source_start:g}s → "
+            f"{record.source_start + record.duration:g}s ({record.duration:g}s)\n"
+            f"  encoding    {record.encoding}",
+            file=sys.stderr,
+        )
+        if not record.confirmed:
+            print(
+                "  Inspect the clip, then re-run with --yes to confirm.",
+                file=sys.stderr,
+            )
+
+
+@app.command("prune")
+def prune_command(
+    youtube_id: str | None = typer.Option(
+        None, "--video", help="Limit to a single YouTube ID."
+    ),
+    clips_dir: Path = typer.Option(
+        Path("./clips"), "--clips-dir", help="Where rough cuts and their sidecars live."
+    ),
+    downloads_dir: Path = typer.Option(
+        Path("./downloads"), "--downloads-dir", help="Where source videos live."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Actually delete. Without this, only reports."
+    ),
+    delete_metadata: bool = typer.Option(
+        False,
+        "--delete-metadata",
+        help="Also delete .info.json/.vtt sidecars (kept by default).",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON records on stdout."),
+) -> None:
+    """Delete source videos whose derived clips are all confirmed."""
+    candidates = plan_prune(
+        clips_dir=clips_dir, downloads_dir=downloads_dir, youtube_id=youtube_id
+    )
+
+    if not candidates:
+        if json_out:
+            sys.stdout.write(json.dumps([]) + "\n")
+        else:
+            print("Nothing to consider — no clips and no source videos.", file=sys.stderr)
+        return
+
+    deletable = [c for c in candidates if c.deletable]
+    reclaimed = sum(c.size_bytes or 0 for c in deletable)
+
+    if yes and deletable:
+        apply_prune(deletable, keep_metadata=not delete_metadata)
+
+    if json_out:
+        sys.stdout.write(json.dumps([c.to_dict() for c in candidates], indent=2) + "\n")
+        return
+
+    for candidate in candidates:
+        size = f"{candidate.size_bytes / 1_000_000_000:.2f}GB" if candidate.size_bytes else "-"
+        if candidate.deleted:
+            tag = "DELETED"
+        elif candidate.deletable:
+            tag = "WOULD DELETE"
+        else:
+            tag = "KEEP"
+        print(
+            f"[{tag}] {Path(candidate.source_file).name}  ({size}) — {candidate.reason}",
+            file=sys.stderr,
+        )
+        for blocker in candidate.blocking_clips:
+            print(f"          blocked by: {blocker}", file=sys.stderr)
+
+    if not deletable:
+        print("\nNothing is eligible for deletion.", file=sys.stderr)
+    elif yes:
+        print(
+            f"\nDeleted {len(deletable)} source file(s), "
+            f"reclaiming {reclaimed / 1_000_000_000:.2f}GB.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"\n{len(deletable)} source file(s) eligible, "
+            f"{reclaimed / 1_000_000_000:.2f}GB reclaimable. "
+            "Re-run with --yes to delete.",
+            file=sys.stderr,
+        )
+
+
 @app.command("segment")
 def segment_command(
     source: Path = typer.Argument(..., exists=True, readable=True, help="Rough run clip to segment."),
-    output: Optional[Path] = typer.Option(
+    output: Path | None = typer.Option(
         None,
         "--output",
         "-o",
@@ -382,7 +888,7 @@ def segment_command(
         "--label-prefix",
         help="Prefix for generated segment labels.",
     ),
-    output_prefix: Optional[str] = typer.Option(
+    output_prefix: str | None = typer.Option(
         None,
         "--output-prefix",
         help="Prefix for generated segment file names.",
@@ -463,7 +969,7 @@ def cut_manifest_command(
 @app.command("review-sheet")
 def review_sheet_command(
     input_path: Path = typer.Argument(..., exists=True, readable=True, help="Clip to summarize as frames."),
-    output: Optional[Path] = typer.Option(
+    output: Path | None = typer.Option(
         None,
         "--output",
         "-o",
@@ -474,7 +980,8 @@ def review_sheet_command(
         "--every-seconds",
         help="Frame sampling interval in seconds.",
     ),
-    columns: int = typer.Option(5, "--columns", help="Number of frames in the contact strip."),
+    columns: int = typer.Option(5, "--columns", help="Frames per row in the contact sheet."),
+    rows: int = typer.Option(1, "--rows", help="Rows in the contact sheet grid."),
     width: int = typer.Option(240, "--width", help="Width of each sampled frame."),
     force: bool = typer.Option(False, "--force", help="Overwrite existing output."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve output but skip ffmpeg."),
@@ -487,6 +994,7 @@ def review_sheet_command(
         output_path=output_path,
         every_seconds=every_seconds,
         columns=columns,
+        rows=rows,
         width=width,
         force=force,
         dry_run=dry_run,
@@ -515,7 +1023,8 @@ def review_manifest_command(
         "--every-seconds",
         help="Frame sampling interval in seconds.",
     ),
-    columns: int = typer.Option(5, "--columns", help="Number of frames in each contact strip."),
+    columns: int = typer.Option(5, "--columns", help="Frames per row in each contact sheet."),
+    rows: int = typer.Option(1, "--rows", help="Rows in each contact sheet grid."),
     width: int = typer.Option(240, "--width", help="Width of each sampled frame."),
     force: bool = typer.Option(False, "--force", help="Overwrite existing outputs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Resolve outputs but skip ffmpeg."),
@@ -528,6 +1037,7 @@ def review_manifest_command(
         output_dir=output_dir,
         every_seconds=every_seconds,
         columns=columns,
+        rows=rows,
         width=width,
         force=force,
         dry_run=dry_run,
@@ -556,14 +1066,14 @@ def review_manifest_command(
 @app.command("vertical")
 def vertical_command(
     input_path: Path = typer.Argument(..., exists=True, readable=True, help="Clip to export vertically."),
-    output: Optional[Path] = typer.Option(
+    output: Path | None = typer.Option(
         None,
         "--output",
         "-o",
         help="Output mp4 path. Defaults to vertical-clips/{input-stem}-vertical.mp4.",
     ),
     start: float = typer.Option(0.0, "--start", help="Start time inside input clip."),
-    duration: Optional[float] = typer.Option(
+    duration: float | None = typer.Option(
         None,
         "--duration",
         help="Optional duration in seconds.",
