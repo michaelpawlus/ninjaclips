@@ -13,10 +13,8 @@ import sqlite3
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
 
 from rapidfuzz import fuzz
-
 
 DEFAULT_DB_PATH = Path.home() / "projects" / "WNL-Athlete-Video-Index" / "data" / "wnl_athlete_video_index.db"
 
@@ -28,7 +26,7 @@ class Appearance:
     athlete_name: str          # canonical display_name from WNL.athletes
     athlete_id: int
     youtube_id: str
-    video_title: Optional[str]
+    video_title: str | None
     timestamp_seconds: int
     confidence: float          # WNL's confidence_score for the appearance
     match_score: float         # rapidfuzz score for athlete_query → athlete name/alias
@@ -45,17 +43,17 @@ class IndexStatus:
     db_path: str
     message: str
     video_exists: bool = False
-    video_title: Optional[str] = None
-    athlete: Optional[str] = None
-    athlete_id: Optional[int] = None
-    matches: Optional[list[dict]] = None
-    appearances: Optional[list[dict]] = None
+    video_title: str | None = None
+    athlete: str | None = None
+    athlete_id: int | None = None
+    matches: list[dict] | None = None
+    appearances: list[dict] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def resolve_db_path(explicit: Optional[Path] = None) -> Path:
+def resolve_db_path(explicit: Path | None = None) -> Path:
     if explicit is not None:
         return explicit
     env = os.environ.get("WNL_DB_PATH")
@@ -133,7 +131,7 @@ def _fuzzy_match_athletes(
 
 def find_appearances(
     athlete_query: str,
-    db_path: Optional[Path] = None,
+    db_path: Path | None = None,
     threshold: float = 70.0,
     exact_top_only: bool = True,
 ) -> tuple[list[Appearance], list[AthleteMatch]]:
@@ -207,7 +205,7 @@ def find_appearances(
 def check_index_status(
     athlete_query: str,
     youtube_id: str,
-    db_path: Optional[Path] = None,
+    db_path: Path | None = None,
     threshold: float = 70.0,
 ) -> IndexStatus:
     """Return whether WNL has an athlete appearance for a specific YouTube ID."""

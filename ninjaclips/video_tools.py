@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+
+from .media import resolve_ffmpeg as _resolve_ffmpeg
+from .media import run as _run
 
 
 @dataclass
@@ -42,49 +42,28 @@ class SegmentManifest:
 class MediaResult:
     input_path: str
     output_path: str
-    start: Optional[float]
-    duration: Optional[float]
+    start: float | None
+    duration: float | None
     status: str
     encoding: str
-    file_size_bytes: Optional[int]
-    error: Optional[str] = None
+    file_size_bytes: int | None
+    error: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-def _resolve_ffmpeg() -> str:
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    try:
-        import static_ffmpeg
-
-        static_ffmpeg.add_paths()
-    except ImportError:
-        pass
-    found = shutil.which("ffmpeg")
-    if not found:
-        raise RuntimeError(
-            "ffmpeg not found on PATH and static_ffmpeg not installed. "
-            "Install ffmpeg or `pip install static-ffmpeg`."
-        )
-    return found
-
-
-def _run(args: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return proc.returncode, proc.stdout
-
-
 def _clean_float(value: float) -> float:
     return int(value) if float(value).is_integer() else round(value, 3)
+
+
+def _contact_vf(every_seconds: float, width: int, columns: int, rows: int) -> str:
+    """Filtergraph for a contact sheet: sample, scale, tile into a grid.
+
+    A single row gets unreadably wide past ~10 frames, so a run-length clip
+    wants a grid. Frames read left-to-right, top-to-bottom.
+    """
+    return f"fps=1/{every_seconds:g},scale={width}:-1,tile={columns}x{rows}"
 
 
 def plan_heuristic_segments(
@@ -94,7 +73,7 @@ def plan_heuristic_segments(
     start_offset: float = 4.0,
     gap: float = 1.0,
     label_prefix: str = "segment",
-    output_prefix: Optional[str] = None,
+    output_prefix: str | None = None,
 ) -> SegmentManifest:
     """Build fixed-window segment candidates for a rough run clip.
 
@@ -264,6 +243,7 @@ def make_review_sheet(
     output_path: Path,
     every_seconds: float = 3.0,
     columns: int = 5,
+    rows: int = 1,
     width: int = 240,
     force: bool = False,
     dry_run: bool = False,
@@ -291,8 +271,7 @@ def make_review_sheet(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = _resolve_ffmpeg()
-    fps = f"1/{every_seconds:g}"
-    vf = f"fps={fps},scale={width}:-1,tile={columns}x1"
+    vf = _contact_vf(every_seconds, width, columns, rows)
     code, output = _run(
         [
             ffmpeg,
@@ -338,6 +317,7 @@ def make_segment_review_sheet(
     duration: float,
     every_seconds: float = 3.0,
     columns: int = 5,
+    rows: int = 1,
     width: int = 240,
     force: bool = False,
     dry_run: bool = False,
@@ -365,8 +345,7 @@ def make_segment_review_sheet(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = _resolve_ffmpeg()
-    fps = f"1/{every_seconds:g}"
-    vf = f"fps={fps},scale={width}:-1,tile={columns}x1"
+    vf = _contact_vf(every_seconds, width, columns, rows)
     code, output = _run(
         [
             ffmpeg,
@@ -413,6 +392,7 @@ def make_manifest_review_sheets(
     output_dir: Path,
     every_seconds: float = 3.0,
     columns: int = 5,
+    rows: int = 1,
     width: int = 240,
     force: bool = False,
     dry_run: bool = False,
@@ -429,6 +409,7 @@ def make_manifest_review_sheets(
                 duration=segment.duration,
                 every_seconds=every_seconds,
                 columns=columns,
+                rows=rows,
                 width=width,
                 force=force,
                 dry_run=dry_run,
@@ -441,7 +422,7 @@ def vertical_center_crop(
     input_path: Path,
     output_path: Path,
     start: float = 0.0,
-    duration: Optional[float] = None,
+    duration: float | None = None,
     height: int = 1920,
     width: int = 1080,
     force: bool = False,

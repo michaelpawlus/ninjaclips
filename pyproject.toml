@@ -17,6 +17,42 @@ dependencies = [
 [project.scripts]
 ninjaclips = "ninjaclips.cli:app"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ninjaclips*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "PL", "BLE"]
+ignore = [
+    # Typer declares CLI options as function-call defaults; this is the
+    # framework's required idiom, not a mutable-default bug.
+    "B008",
+    # A CLI surface is wide by nature: many options, and one branch per
+    # failure mode the user needs a distinct message for.
+    "PLR0913",
+    "PLR0917",
+    "PLR0912",
+    "PLR0915",
+    "PLR2004",
+    # `import static_ffmpeg` is deliberately lazy — it is an optional fallback
+    # that must not be paid for when a real ffmpeg is on PATH.
+    "PLC0415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# yt-dlp raises a wide family of exceptions; catching broadly and reporting the
+# URL as failed is the intended behaviour.
+"ninjaclips/download.py" = ["BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
