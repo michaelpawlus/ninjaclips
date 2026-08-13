@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a PR makes the in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor declared in pyproject; 3.12 is what .python-version
+        # pins locally. Testing both keeps requires-python honest.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # --locked fails if pyproject.toml and uv.lock have drifted, so a
+      # dependency change without a re-lock is caught here rather than on
+      # someone else's machine.
+      - name: Install dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python-version }} ruff check .
+
+      # The suite needs no ffmpeg: every media path is either dry-run or
+      # stubbed, so CI stays fast and has no system dependencies.
+      - name: Test
+        run: uv run --python ${{ matrix.python-version }} pytest -q
