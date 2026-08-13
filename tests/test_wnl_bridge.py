@@ -58,7 +58,9 @@ def _make_fixture_db(path: Path) -> None:
         ],
     )
     conn.executemany(
-        "INSERT INTO athlete_appearances (athlete_id, video_id, timestamp_seconds, confidence_score) VALUES (?, ?, ?, ?)",
+        "INSERT INTO athlete_appearances "
+        "(athlete_id, video_id, timestamp_seconds, confidence_score) "
+        "VALUES (?, ?, ?, ?)",
         [
             (1, 1, 300, 0.95),
             (1, 1, 1820, 0.9),

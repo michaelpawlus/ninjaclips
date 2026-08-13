@@ -18,7 +18,6 @@ from ninjaclips.video_tools import (
     write_manifest,
 )
 
-
 runner = CliRunner()
 
 

@@ -10,6 +10,8 @@ from pathlib import Path
 
 import yt_dlp
 
+from .source_resolver import find_source_file
+
 
 def _ensure_ffmpeg() -> None:
     """Make ffmpeg/ffprobe available on PATH so yt-dlp can merge formats."""
@@ -32,20 +34,58 @@ class DownloadConfig:
     info_json: bool = True
     dry_run: bool = False
     json_output: bool = False
+    # Fetch only [section_start, section_end) instead of the whole video.
+    section_start: float | None = None
+    section_end: float | None = None
+
+    @property
+    def sectioned(self) -> bool:
+        return self.section_start is not None and self.section_end is not None
+
+
+def write_section_sidecar(path: Path, youtube_id: str, start: float, end: float) -> Path:
+    """Record where a partial download sits inside the original video.
+
+    A sectioned file's t=0 is *not* the source's t=0. Every timestamp in this
+    project is source-absolute, so the offset has to be written down or every
+    later cut against this file silently lands `start` seconds early.
+    """
+    sidecar = path.with_suffix(".section.json")
+    sidecar.write_text(
+        json.dumps(
+            {
+                "youtube_id": youtube_id,
+                "section_start": start,
+                "section_end": end,
+                "note": (
+                    "This file is a partial download. Add section_start to any "
+                    "time measured within it to get a source-absolute timestamp."
+                ),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return sidecar
 
 
 def _ydl_opts(config: DownloadConfig) -> dict:
     out = config.output_dir
-    # Format fallback chain: prefer merged best video+audio mp4, but if ffmpeg
-    # isn't installed yt-dlp will fail the merge — fall back to a pre-merged
-    # single mp4, then to "best" of any container.
+    # Don't constrain the codec: pinning [ext=mp4]/[ext=m4a] restricts YouTube
+    # to AVC+AAC and hides the VP9/AV1+opus renditions, which are smaller at
+    # equal quality and are the only source for >1080p. `<=?` makes the height
+    # cap soft, so a video with no rendition under the cap still resolves.
     fmt = (
-        f"bestvideo[height<={config.max_height}][ext=mp4]+bestaudio[ext=m4a]"
-        f"/best[height<={config.max_height}][ext=mp4]"
-        f"/best[ext=mp4]/best"
+        f"bestvideo[height<=?{config.max_height}]+bestaudio"
+        f"/best[height<=?{config.max_height}]"
+        f"/best"
     )
     opts: dict = {
         "format": fmt,
+        # `fps` ahead of `vcodec` so a 60fps rendition wins over a
+        # better-codec 30fps one — 60fps source halves the frame-interpolation
+        # factor needed for a given slow-motion ramp.
+        "format_sort": ["res", "fps", "vcodec", "acodec", "br"],
         "merge_output_format": "mp4",
         "outtmpl": str(out / "%(uploader)s - %(title)s [%(id)s].%(ext)s"),
         "download_archive": str(out / "downloaded.txt"),
@@ -60,9 +100,47 @@ def _ydl_opts(config: DownloadConfig) -> dict:
         "quiet": config.json_output,
         "no_warnings": config.json_output,
     }
+    if config.sectioned:
+        from yt_dlp.utils import download_range_func
+
+        opts["download_ranges"] = download_range_func(
+            None, [(config.section_start, config.section_end)]
+        )
+        # Extend each cut out to a keyframe so the section decodes cleanly from
+        # its first frame instead of opening on a partial GOP.
+        opts["force_keyframes_at_cuts"] = True
+        # Mark the range in the filename: a partial file must never be mistaken
+        # for the full video, since cuts against it need an offset.
+        opts["outtmpl"] = str(
+            out
+            / (
+                "%(uploader)s - %(title)s [%(id)s] "
+                f"[sec {int(config.section_start)}-{int(config.section_end)}].%(ext)s"
+            )
+        )
+        # The archive records a bare video id, so a partial download would
+        # otherwise make a later full download silently no-op.
+        opts.pop("download_archive", None)
+
     if config.dry_run:
         opts["skip_download"] = True
     return opts
+
+
+def _actual_filepath(entry: dict) -> str | None:
+    """Return the path yt-dlp actually wrote, or None if nothing landed.
+
+    `ydl.prepare_filename()` re-renders the output template and is only a
+    prediction: for merged formats it reports the pre-merge extension, so it
+    can name a file that does not exist. yt-dlp records what it really wrote
+    in `requested_downloads[*].filepath`. Anything that deletes source media
+    must use this, never the prediction.
+    """
+    for download in entry.get("requested_downloads") or []:
+        path = download.get("filepath")
+        if path:
+            return path
+    return None
 
 
 def _emit_json(record: dict) -> None:
@@ -106,7 +184,15 @@ def download_urls(urls: list[str], config: DownloadConfig) -> list[str]:
             entries = info.get("entries") if info.get("_type") == "playlist" else [info]
             for entry in entries or []:
                 if entry is None:
+                    # `ignoreerrors` turns a failed playlist item into a None
+                    # entry rather than raising.
+                    failures.append(url)
+                    if config.json_output:
+                        _emit_json(
+                            {"url": url, "status": "error", "error": "entry failed to extract"}
+                        )
                     continue
+
                 record = {
                     "url": entry.get("webpage_url") or url,
                     "id": entry.get("id"),
@@ -114,14 +200,57 @@ def download_urls(urls: list[str], config: DownloadConfig) -> list[str]:
                     "uploader": entry.get("uploader"),
                     "duration": entry.get("duration"),
                     "upload_date": entry.get("upload_date"),
-                    "status": "resolved" if config.dry_run else "downloaded",
-                    "filepath": (
-                        ydl.prepare_filename(entry)
-                        if not config.dry_run
-                        else None
-                    ),
                 }
+
+                if config.dry_run:
+                    record["status"] = "resolved"
+                    record["filepath"] = None
+                else:
+                    # `ignoreerrors` lets a failed download still yield a fully
+                    # populated entry, so presence of the entry proves nothing.
+                    # Only a file on disk means the download succeeded.
+                    path = _actual_filepath(entry)
+                    if path and Path(path).exists():
+                        record["status"] = "downloaded"
+                        record["filepath"] = path
+                        record["file_size_bytes"] = Path(path).stat().st_size
+                        if config.sectioned:
+                            record["section_start"] = config.section_start
+                            record["section_end"] = config.section_end
+                            record["section_sidecar"] = str(
+                                write_section_sidecar(
+                                    Path(path),
+                                    entry.get("id") or "",
+                                    config.section_start,
+                                    config.section_end,
+                                )
+                            )
+                    elif ydl.in_download_archive(entry):
+                        # Already in downloaded.txt, so yt-dlp wrote nothing by
+                        # design. Recover the existing file by globbing the id;
+                        # this is a success, not a failure.
+                        existing = find_source_file(entry.get("id") or "", config.output_dir)
+                        record["status"] = "skipped"
+                        record["filepath"] = str(existing) if existing else None
+                        if existing:
+                            record["file_size_bytes"] = existing.stat().st_size
+                        else:
+                            record["error"] = (
+                                "in download archive but no matching file found "
+                                f"in {config.output_dir} — media may have been pruned"
+                            )
+                    else:
+                        record["status"] = "error"
+                        record["filepath"] = None
+                        record["error"] = (
+                            "yt-dlp reported no written file "
+                            "(download failed or was skipped by the archive)"
+                        )
+                        failures.append(entry.get("webpage_url") or url)
+
                 if config.json_output:
                     _emit_json(record)
+                elif record["status"] == "error":
+                    print(f"ERROR: {record['url']}: {record['error']}", file=sys.stderr)
 
     return failures

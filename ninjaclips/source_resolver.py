@@ -8,10 +8,9 @@ So we glob for `*[{id}].mp4` (and a few other extensions) to recover the path.
 
 from __future__ import annotations
 
+import json
 import unicodedata
 from pathlib import Path
-from typing import Optional
-
 
 VIDEO_EXTS = (".mp4", ".mkv", ".webm")
 
@@ -22,12 +21,14 @@ def _strip_diacritics(s: str) -> str:
     )
 
 
-def find_source_file(youtube_id: str, downloads_dir: Path) -> Optional[Path]:
+def find_source_file(youtube_id: str, downloads_dir: Path) -> Path | None:
     """Return the source video for a YouTube ID, or None if not downloaded.
 
     Matches any file with `[{youtube_id}]` in the basename and a known video
-    extension. If multiple files match (unlikely but possible — same ID could
-    appear in different containers), prefer .mp4, then the first found.
+    extension. When several match, prefer a full download over a partial
+    (`--sections`) one — a partial covers only part of the timeline, so a cut
+    outside its window would fail against it but succeed against the full file.
+    Then prefer .mp4, then sort by name for determinism.
     """
     if not downloads_dir.exists():
         return None
@@ -42,8 +43,34 @@ def find_source_file(youtube_id: str, downloads_dir: Path) -> Optional[Path]:
     if not matches:
         return None
 
-    matches.sort(key=lambda p: (0 if p.suffix == ".mp4" else 1, p.name))
+    matches.sort(
+        key=lambda p: (
+            1 if p.with_suffix(".section.json").exists() else 0,
+            0 if p.suffix == ".mp4" else 1,
+            p.name,
+        )
+    )
     return matches[0]
+
+
+def section_offset(source_file: Path) -> float:
+    """Seconds between the source's t=0 and this file's t=0.
+
+    Zero for a full download. For a partial (`--sections`) download, the value
+    recorded in its `.section.json` sidecar. Callers seeking to a
+    source-absolute timestamp must subtract this from the seek position.
+    """
+    sidecar = source_file.with_suffix(".section.json")
+    if not sidecar.exists():
+        return 0.0
+    try:
+        data = json.loads(sidecar.read_text())
+    except json.JSONDecodeError:
+        return 0.0
+    try:
+        return float(data.get("section_start") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def title_fragment(source_file: Path) -> str:
@@ -53,8 +80,9 @@ def title_fragment(source_file: Path) -> str:
     portion, truncate, and replace filesystem-hostile characters with `_`.
     """
     stem = source_file.stem
-    # Drop the trailing ` [id]`
-    if " [" in stem:
+    # Drop every trailing ` [...]` group — a full download ends with ` [id]`,
+    # a partial one with ` [id] [sec START-END]`.
+    while stem.rstrip().endswith("]") and " [" in stem:
         stem = stem.rsplit(" [", 1)[0]
     # Drop the leading `uploader - `
     if " - " in stem:
