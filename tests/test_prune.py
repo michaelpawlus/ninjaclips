@@ -133,6 +133,41 @@ def test_apply_prune_deletes_source_and_keeps_metadata(tmp_path: Path):
     assert info.exists(), "metadata sidecar should survive by default"
 
 
+def test_prune_clears_the_archive_entry_so_redownload_works(tmp_path: Path):
+    """Leaving the entry would make a later re-download silently no-op."""
+    clips, downloads = _setup(tmp_path)
+    source = _source(downloads)
+    archive = downloads / "downloaded.txt"
+    archive.write_text("youtube AIYxvfxnbz8\nyoutube KEEPTHISONE\n")
+    mark_confirmed(_clip(clips, source, "esme"))
+
+    candidates = plan_prune(clips, downloads)
+    applied = apply_prune([c for c in candidates if c.deletable])
+
+    assert applied[0].archive_entry_cleared is True
+    remaining = archive.read_text().splitlines()
+    assert "youtube AIYxvfxnbz8" not in remaining
+    assert "youtube KEEPTHISONE" in remaining, "other videos must stay archived"
+
+
+def test_blocked_source_keeps_its_archive_entry(tmp_path: Path):
+    clips, downloads = _setup(tmp_path)
+    source = _source(downloads)
+    archive = downloads / "downloaded.txt"
+    archive.write_text("youtube AIYxvfxnbz8\n")
+    _clip(clips, source, "esme")  # unconfirmed
+
+    apply_prune([c for c in plan_prune(clips, downloads) if c.deletable])
+
+    assert "youtube AIYxvfxnbz8" in archive.read_text()
+
+
+def test_forget_from_archive_without_archive_file(tmp_path: Path):
+    from ninjaclips.prune import forget_from_archive
+
+    assert forget_from_archive(tmp_path, "abc") is False
+
+
 def test_apply_prune_never_touches_blocked_sources(tmp_path: Path):
     clips, downloads = _setup(tmp_path)
     source = _source(downloads)

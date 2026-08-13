@@ -22,6 +22,30 @@ from .ledger import ClipRecord, iter_records
 # Kept next to a pruned source so its provenance survives the media.
 METADATA_SUFFIXES = (".info.json", ".vtt")
 
+ARCHIVE_NAME = "downloaded.txt"
+
+
+def forget_from_archive(downloads_dir: Path, youtube_id: str) -> bool:
+    """Drop a video's line from the yt-dlp download archive.
+
+    Deleting the media while leaving the archive entry would make a later
+    re-download silently no-op ("has already been recorded in the archive"),
+    breaking the one recovery path a pruned source has. Returns True if a line
+    was removed.
+    """
+    archive = downloads_dir / ARCHIVE_NAME
+    if not archive.exists() or not youtube_id:
+        return False
+
+    lines = archive.read_text().splitlines()
+    # Entries are "{extractor} {id}", e.g. "youtube AIYxvfxnbz8".
+    kept = [line for line in lines if line.strip().split()[-1:] != [youtube_id]]
+    if len(kept) == len(lines):
+        return False
+
+    archive.write_text("".join(f"{line}\n" for line in kept))
+    return True
+
 
 @dataclass
 class PruneCandidate:
@@ -37,6 +61,7 @@ class PruneCandidate:
     confirmed_count: int
     blocking_clips: list[str] = field(default_factory=list)
     deleted: bool = False
+    archive_entry_cleared: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -133,6 +158,11 @@ def apply_prune(
             continue
         source.unlink()
         candidate.deleted = True
+        # Re-downloading is the only recovery a pruned source has; leaving the
+        # archive entry behind would make that silently no-op.
+        candidate.archive_entry_cleared = forget_from_archive(
+            source.parent, candidate.youtube_id
+        )
 
         if not keep_metadata:
             stem = source.with_suffix("")
