@@ -56,8 +56,39 @@ smaller at equal quality and are the only source above 1080p. Sorting puts
 60fps source halves the interpolation factor needed for a given slow-motion
 ramp.
 
+`--max-height` caps the **short side**, not the height, and is therefore
+orientation-independent: `--max-height 1440` gives 2560x1440 from a landscape
+4K source and the full 1080x1920 from a portrait one. This is implemented as
+yt-dlp's `res:N` sort key (`res` is the smallest dimension), never as a
+`[height<=?N]` filter — a height filter is orientation-blind and silently
+selects 720x1280 for a portrait 1080x1920 source, which looks like a
+successful download. Some WNL sources really are portrait.
+
 Raise `--max-height` when the vertical export matters: a 9:16 crop of 1080p is
 only 607px wide, versus 810px from 1440p.
+
+### Download environment requirements
+
+These are not optional. Each one fails *silently* or as an unexplained 403, and
+under the season-archive deadline a degraded download is unrecoverable.
+
+- **`deno` must be on PATH** (`brew install deno`). Without a JS runtime,
+  yt-dlp falls back to the `android vr` API and offers only AVC up to 1080p —
+  no VP9/AV1, no 1440p/4K. It warns, then succeeds anyway, so the download
+  looks fine.
+- **`curl-cffi` pinned `>=0.10,<0.16`** (in `pyproject.toml`). Some formats
+  require impersonation and 403 without it. Version 0.16+ is rejected by
+  yt-dlp, which then reports every impersonate target as "unavailable" —
+  that reads like "won't help" but means "wrong version".
+- **Never set `force_keyframes_at_cuts`** alongside `download_ranges`. It
+  routes the ranged fetch through ffmpeg, which requests the googlevideo URL
+  without the extracting client's identity and gets a hard 403. Dropping it
+  still trims exactly (15.001s for a 15s request) and decodes cleanly from
+  frame 0.
+
+`tests/test_download_opts.py` pins all of the above. Verify a batch actually
+got what you wanted by reading `source_width`/`source_height` in each clip's
+JSON ledger — not by assuming the flags worked.
 
 ## Stage 2 — rough cut (current)
 
@@ -170,6 +201,27 @@ the ledger, keeping timestamps comparable across full and partial downloads.
 Requesting a time outside a partial file's window is a loud error, never a
 silently wrong cut. When both a full and a partial copy exist, the full one
 wins.
+
+**Sectioned downloads 403 intermittently — just retry.** yt-dlp fetches ranged
+downloads through ffmpeg regardless of options, and YouTube rejects a share of
+those requests. Observed roughly a 50% failure rate on the first pass, but the
+failures are *transient rather than per-video*: the same URL that fails one
+minute succeeds the next, and 4 of 6 stubborn rows recovered within two retry
+passes. Do not conclude a video is unavailable from a single 403. Full
+downloads use yt-dlp's own downloader and do not hit this at all, so they are
+the fallback for a row that survives several retries.
+
+Retry by re-deriving the work list from **clip ledgers on disk** rather than by
+parsing the log — a row counts as done only if its `.json` ledger exists. That
+catches a row that downloaded but failed during the cut, and it does not depend
+on having matched the right error text.
+
+**`[CREATED]` means cut; `[EXISTS]` means skipped, not verified.** `batch`
+skips a cut when the output path is already present. If a previous run was
+interrupted mid-encode, the leftover `.mp4` is truncated and unplayable
+(`moov atom not found`) yet still suppresses the re-cut, leaving a corrupt file
+posing as an archived run. A clip `.mp4` with no `.json` ledger beside it is
+exactly this case — delete it before retrying.
 
 **Pad generously.** The source is deleted after confirmation, so the rough cut
 is the only artifact later stages can be cut from. Head and tail padding is
