@@ -1,4 +1,8 @@
 # One row per run to archive: url, start, end, athlete
 # Times accept 4243 or 1:10:43. Lines starting with # are ignored.
+#
+# This is a template. Real job lists pair an athlete's name with exact
+# timestamps of their appearances, so they stay local — jobs*.csv is
+# gitignored. Copy this to jobs.csv and fill in your own rows.
 url,start,end,athlete
-https://www.youtube.com/live/AIYxvfxnbz8?t=4243,1:10:43,1:14:55,Esme Newton-Pawlus
+https://www.youtube.com/live/VIDEOID11CH?t=4243,1:10:43,1:14:55,Athlete Name

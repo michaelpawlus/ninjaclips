@@ -20,3 +20,9 @@ content/
 *.vtt
 *.info.json
 download.log
+
+# Operator job lists: these pair an athlete's name with exact timestamps of
+# their appearances. The repo is public, so keep the index local even though
+# the source videos are not. The example file is a template with no real data.
+jobs*.csv
+!jobs.example.csv

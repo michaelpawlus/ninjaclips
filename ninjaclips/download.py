@@ -73,19 +73,21 @@ def _ydl_opts(config: DownloadConfig) -> dict:
     out = config.output_dir
     # Don't constrain the codec: pinning [ext=mp4]/[ext=m4a] restricts YouTube
     # to AVC+AAC and hides the VP9/AV1+opus renditions, which are smaller at
-    # equal quality and are the only source for >1080p. `<=?` makes the height
-    # cap soft, so a video with no rendition under the cap still resolves.
-    fmt = (
-        f"bestvideo[height<=?{config.max_height}]+bestaudio"
-        f"/best[height<=?{config.max_height}]"
-        f"/best"
-    )
+    # equal quality and are the only source for >1080p.
+    fmt = "bestvideo+bestaudio/best"
     opts: dict = {
         "format": fmt,
+        # Cap via `res:N` rather than a `[height<=?N]` filter. yt-dlp's `res`
+        # is the *smallest* dimension, so this caps the short side and is
+        # correct in both orientations. A height filter is orientation-blind:
+        # against a portrait 1080x1920 source, `height<=1440` excludes the
+        # native rendition and silently selects 720x1280 — a real downgrade
+        # that looks like a successful download.
+        #
         # `fps` ahead of `vcodec` so a 60fps rendition wins over a
         # better-codec 30fps one — 60fps source halves the frame-interpolation
         # factor needed for a given slow-motion ramp.
-        "format_sort": ["res", "fps", "vcodec", "acodec", "br"],
+        "format_sort": [f"res:{config.max_height}", "fps", "vcodec", "acodec", "br"],
         "merge_output_format": "mp4",
         "outtmpl": str(out / "%(uploader)s - %(title)s [%(id)s].%(ext)s"),
         "download_archive": str(out / "downloaded.txt"),
@@ -106,9 +108,14 @@ def _ydl_opts(config: DownloadConfig) -> dict:
         opts["download_ranges"] = download_range_func(
             None, [(config.section_start, config.section_end)]
         )
-        # Extend each cut out to a keyframe so the section decodes cleanly from
-        # its first frame instead of opening on a partial GOP.
-        opts["force_keyframes_at_cuts"] = True
+        # NOT force_keyframes_at_cuts. That option routes the ranged fetch
+        # through ffmpeg, which requests the googlevideo URL without the
+        # extracting client's identity and gets a hard 403 on every high-quality
+        # format — the only ones that survive are the 360p pre-merged renditions.
+        # yt-dlp's own fragment downloader has no such problem, still trims to
+        # the exact requested window (measured: 15.001s for a 15s request, 450
+        # frames at 30fps), and decodes cleanly from frame 0, so the partial-GOP
+        # risk the flag guarded against does not materialise here.
         # Mark the range in the filename: a partial file must never be mistaken
         # for the full video, since cuts against it need an offset.
         opts["outtmpl"] = str(

@@ -75,7 +75,7 @@ def download(
     max_height: int = typer.Option(
         1080,
         "--max-height",
-        help="Cap video resolution by height.",
+        help="Cap video resolution by short side (orientation-independent).",
     ),
     subs: bool = typer.Option(
         True,
@@ -555,7 +555,11 @@ def batch_command(
     ),
     downloads_dir: Path = typer.Option(Path("./downloads"), "--downloads-dir"),
     output_dir: Path = typer.Option(Path("./clips"), "--output-dir", "-o"),
-    max_height: int = typer.Option(1440, "--max-height", help="Cap video resolution."),
+    max_height: int = typer.Option(
+        1440,
+        "--max-height",
+        help="Cap video resolution by short side (orientation-independent).",
+    ),
     pre_pad: float = typer.Option(
         30, "--pre-pad", help="Seconds of lead-in kept before each start."
     ),
