@@ -12,6 +12,7 @@ dependencies = [
     "yt-dlp>=2024.10.7",
     "static-ffmpeg>=3.0",
     "rapidfuzz>=3.0",
+    "curl-cffi>=0.10,<0.16",
 ]
 
 [project.scripts]
